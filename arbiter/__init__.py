@@ -1,45 +1,88 @@
+import os
+import sys
 import signal
-import gevent
-from daemon import DaemonContext
+import logging
 
-from .manager import WorkerManager
+from . import coroutine
+from .coroutine import Coroutine
+from .worker import WorkerManager
+
+logging.basicConfig(
+	level=getattr(logging, os.getenv('PY_LOG_LEVEL', 'INFO'), logging.INFO)
+)
+logger = logging.getLogger(__name__)
 
 
 class Arbiter(object):
-	SIGNAL_NAMES = 'HUP QUIT INT TERM TTIN TTOU'.split()
+	SIGNAL_NAMES = 'HUP QUIT INT TERM CHLD TTIN TTOU'.split()
 
-	def __init__(self, worker, num):
-		self.manager = WorkerManager(worker=worker, worker_num=num)
+	def __init__(
+		self, entry_func, replicas, bind_address=None, graceful_timeout=30
+	):
+		self.running = False
+
+		self.worker_manager = WorkerManager(
+			entry_func,
+			replicas,
+			graceful_timeout=graceful_timeout,
+			bind_address=bind_address
+		)
+
+		self.graceful_timeout = graceful_timeout
 
 	def run(self, **context):
-		daemon_context = DaemonContext(**context)
+		self.add_signal_handlers()
 
-		daemon_context.signal_map = {
-			getattr(signal, signal_name): self.stash_signal
-			for signal_name in self.SIGNAL_NAMES
-		}
-
-		with daemon_context:
-			self._run()
+		# TODO: daemonize
+		self._run()
 
 	def _run(self):
-		self.manager.start()
-		self.add_timer(self.maintain_workers, interval=1)
-		self.add_timer(self.handle_signals, interval=1)
+		worker_manager = self.worker_manager
+		Coroutine(target=worker_manager.run).start()
 
-	def add_timer(self, job, interval):
-		def _timer():
-			while True:
-				job()
-				gevent.sleep(interval)
+		self.running = True
+		while self.running:
+			coroutine.sleep(1)
 
-		return gevent.spawn(_timer)
+		logger.info('arbiter exiting')
+		worker_manager.stop()
+		sys.exit(0)
 
-	def maintain_workers(self):
-		self.manager.maintain()
+	def add_signal_handlers(self):
+		for signal_name in self.SIGNAL_NAMES:
+			sig = getattr(signal, 'SIG' + signal_name)
+			handler = getattr(self, 'handle_' + signal_name)
+			coroutine.add_signal_handler(sig, handler)
 
-	def handle_signals(self):
-		pass
+	def handle_HUP(self, signum, frame):
+		logger.info('handling signal HUP')
+		self.worker_manager.purge()
+		self.worker_manager.maintain()
 
-	def stash_signal(self, signum, frame):
-		self.stash
+	def handle_TERM(self, signum, frame):
+		logger.info('handling signal %s' % signum)
+		self.running = False
+
+	handle_QUIT = handle_INT = handle_TERM
+
+	def handle_CHLD(self, signum, frame):
+		logger.info('handling signal CHLD')
+		while True:
+			try:
+				pid, status = os.waitpid(-1, os.WNOHANG)
+			except OSError:
+				# No child processes
+				break
+			else:
+				if pid == 0:
+					break
+
+			self.worker_manager.reap_exited(pid)
+
+	def handle_TTIN(self, signum, frame):
+		logger.info('handling signal TTIN')
+		self.worker_manager.incr_worker()
+
+	def handle_TTOU(self, signum, frame):
+		logger.info('handling signal TTOU')
+		self.worker_manager.decr_worker()
