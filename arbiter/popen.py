@@ -56,25 +56,27 @@ class Popen(object):
 			if exit_code is not None:
 				break
 
-			if deadline <= time.time():
+			balance = deadline - time.time()
+			if balance <= 0:
 				break
 
-			coroutine.sleep(1)
+			coroutine.sleep(min(1, balance))
 		return exit_code
 
-	def terminate(self, graceful_timeout=30):
+	def terminate(self):
 		if self.exit_code is None:
+			logger.info('soft kill child %s' % self.pid)
 			try:
-				logger.info('soft kill child %s' % self.pid)
 				os.kill(self.pid, signal.SIGTERM)
 			except OSError as e:
 				if self.wait(timeout=0.1) is None:
 					raise
-			else:
-				coroutine.sleep(graceful_timeout)
-				self.kill()
 
 	def kill(self):
 		if self.exit_code is None:
 			logger.warn('hard kill child %s' % self.pid)
-			os.kill(self.pid, signal.SIGKILL)
+			try:
+				os.kill(self.pid, signal.SIGKILL)
+			except OSError as e:
+				if self.wait(timeout=0.1) is None:
+					raise

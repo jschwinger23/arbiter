@@ -17,7 +17,7 @@ class Arbiter(object):
 	SIGNAL_NAMES = 'HUP QUIT INT TERM CHLD TTIN TTOU'.split()
 
 	def __init__(
-		self, entry_func, replicas, bind_address=None, graceful_timeout=30
+		self, entry_func, replicas, graceful_timeout=30
 	):
 		self.running = False
 
@@ -25,7 +25,6 @@ class Arbiter(object):
 			entry_func,
 			replicas,
 			graceful_timeout=graceful_timeout,
-			bind_address=bind_address
 		)
 
 		self.graceful_timeout = graceful_timeout
@@ -44,7 +43,7 @@ class Arbiter(object):
 		while self.running:
 			coroutine.sleep(1)
 
-		logger.info('arbiter exiting')
+		logger.info('[arbiter] exiting')
 		worker_manager.stop()
 		sys.exit(0)
 
@@ -55,34 +54,23 @@ class Arbiter(object):
 			coroutine.add_signal_handler(sig, handler)
 
 	def handle_HUP(self, signum, frame):
-		logger.info('handling signal HUP')
+		logger.info('[arbiter] handling signal HUP')
 		self.worker_manager.purge()
 		self.worker_manager.maintain()
 
 	def handle_TERM(self, signum, frame):
-		logger.info('handling signal %s' % signum)
+		logger.info('[arbiter] handling signal %s' % signum)
 		self.running = False
 
 	handle_QUIT = handle_INT = handle_TERM
 
 	def handle_CHLD(self, signum, frame):
-		logger.info('handling signal CHLD')
-		while True:
-			try:
-				pid, status = os.waitpid(-1, os.WNOHANG)
-			except OSError:
-				# No child processes
-				break
-			else:
-				if pid == 0:
-					break
-
-			self.worker_manager.reap_exited(pid)
+		pass
 
 	def handle_TTIN(self, signum, frame):
-		logger.info('handling signal TTIN')
+		logger.info('[arbiter] handling signal TTIN')
 		self.worker_manager.incr_worker()
 
 	def handle_TTOU(self, signum, frame):
-		logger.info('handling signal TTOU')
+		logger.info('[arbiter] handling signal TTOU')
 		self.worker_manager.decr_worker()

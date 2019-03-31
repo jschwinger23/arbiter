@@ -1,18 +1,20 @@
-import socket
+import sys
 import functools
 from logging import getLogger
 
 from . import coroutine
 from .coroutine import Coroutine
 from .popen import Popen
+from .fd_pool import FDPool
 
 logger = getLogger(__name__)
 
 
 class Worker(object):
-	def __init__(self, entry_func, socket=None):
+	def __init__(self, entry_func):
 		self.entry_func = entry_func
 		self.wrapper = self._wrap(entry_func)
+		self._fd_pool = FDPool.get_instance()
 
 	def __call__(self):
 		return self.wrapper()
@@ -20,46 +22,28 @@ class Worker(object):
 	def _wrap(self, func):
 		@functools.wraps(func)
 		def wrapper():
-			func(socket)
+			self._fd_pool.on_fork()
+			func()
+			sys.exit(0)
 
 		return wrapper
 
 
 class WorkerManager(object):
 	def __init__(
-		self,
-		entry_func,
-		replicas,
-		graceful_timeout=30,
-		bind_address=None,
-		heartbeat_timeout=30
+		self, entry_func, replicas, graceful_timeout=30, heartbeat_timeout=30
 	):
 		self.entry_func = entry_func
 		self.replicas = replicas
 		self.graceful_timeout = graceful_timeout
-		self.bind_address = bind_address
 		self.heartbeat_timeout = heartbeat_timeout
 
-		self.sock = None
-		self._popens = {}
+		self._popens = []
 		self._running = False
 
-		if bind_address:
-			family = socket.AF_INET
-			if bind_address.startswith('unix:'):
-				family = socket.AF_UNIX
-				bind_address = bind_address[5:]
-			self.sock = socket.socket(family, socket.SOCK_STREAM)
-			self.bind
-
-		self.worker = Worker(entry_func, self.sock)
+		self.worker = Worker(entry_func)
 
 	def run(self):
-
-		if self.sock:
-			self.sock.bind(self.bind_address)
-			self.sock.listen(2048)
-
 		self._running = True
 		while self._running:
 			Coroutine(target=self.maintain).start()
@@ -67,42 +51,54 @@ class WorkerManager(object):
 
 	def stop(self):
 		self._running = False
-		self.purge(scorch=True)
+		self.purge(sterilize=True)
 
-	def purge(self, scorch=False):
-		logger.info('kill all children')
+	def purge(self, sterilize=False):
+		logger.info('[arbiter] kill all children')
 
-		if scorch:
+		if sterilize:
 			self.replicas = 0
 
 		coros = []
 		while self._popens:
-			pid, popen = self._popens.popitem()
-			coro = Coroutine(target=popen.terminate, args=(self.graceful_timeout,))
+			popen = self._popens.pop()
+			coro = Coroutine(
+				target=self._gracefully_terminate, args=(popen, self.graceful_timeout)
+			)
 			coro.start()
 			coros.append(coro)
 
 		for coro in coros:
 			coro.join()
 
+	def _gracefully_terminate(self, popen, timeout):
+		popen.terminate()
+		exit_code = popen.wait(timeout)
+		if exit_code is None:
+			popen.kill()
+
 	def maintain(self):
-		logger.debug('maintaining workers')
+		logger.debug('[arbiter] maintaining workers')
+		self._reap()
 		self._repopulate()
 		self._depopulate()
 
-	def reap_exited(self, pid):
-		if pid not in self._popens:
-			# terminated by manager
-			return
-
-		del self._popens[pid]
-		logger.info('worker %s reaped' % pid)
+	def _reap(self):
+		for i, popen in enumerate(self._popens):
+			if popen.poll() is not None:
+				logger.info('[arbiter] worker %s reaped' % popen.pid)
+				del self._popens[i]
 
 	def _depopulate(self):
 		coros = []
 		while len(self._popens) > self.replicas:
-			pid, popen = self._popens.popitem()
-			coro = Coroutine(target=popen.terminate, args=(self.graceful_timeout,))
+			popen = self._popens.pop()
+			coro = Coroutine(
+				target=self._gracefully_terminate, args=(
+				popen,
+				self.graceful_timeout,
+				)
+			)
 			coro.start()
 			coros.append(coro)
 
@@ -113,17 +109,17 @@ class WorkerManager(object):
 		shortage = self.replicas - len(self._popens)
 		for _ in range(shortage):
 			popen = Popen(self.worker)
-			self._popens[popen.pid] = popen
+			self._popens.append(popen)
 
 		if shortage > 0:
-			logger.info('%s worker(s) supplemented' % shortage)
+			logger.info('[arbiter] %s worker(s) supplemented' % shortage)
 
 	def incr_worker(self):
-		logger.info('one worker increased')
+		logger.info('[arbiter] one worker increased')
 		self.replicas += 1
 		self.maintain()
 
 	def decr_worker(self):
-		logger.info('one worker decreased')
+		logger.info('[arbiter] one worker decreased')
 		self.replicas -= 1
 		self.maintain()

@@ -1,7 +1,7 @@
 import select
-import linuxfd
 from collections import namedtuple, deque
-from pysigset import sigprocmask, sigaddset, SIG_SETMASK, SIGSET, NULL
+
+from .fd_pool import FDPool
 
 
 class Event(namedtuple('Event', ['fd', 'func'])):
@@ -11,8 +11,8 @@ class Event(namedtuple('Event', ['fd', 'func'])):
 
 class TimerEvent(Event):
 	def callback(self, ioloop):
-		ioloop.del_reader(self.fd)
 		self.fd.read()
+		ioloop.del_reader(self.fd)
 		self.func()
 
 
@@ -36,6 +36,7 @@ class IOLoop(object):
 		self.writers = set()
 		self.fds = {}
 		self.ready = deque()
+		self.fd_pool = FDPool.get_instance()
 
 	def run_forever(self):
 		self.running = True
@@ -63,20 +64,15 @@ class IOLoop(object):
 	def del_reader(self, fd):
 		del self.fds[fd]
 		self.readers.remove(fd)
+		self.fd_pool.release(fd)
 
 	def call_soon(self, callback):
 		self.ready.appendleft(callback)
 
 	def call_later(self, delay, func):
-		fd = linuxfd.timerfd(rtc=True, nonBlocking=True)
-		fd.settime(delay, 0)
+		fd = self.fd_pool.get_timerfd(delay)
 		self.add_reader(fd, TimerEvent(fd, func).callback)
 
 	def add_signal_handler(self, sig, func):
-		sigset = SIGSET()
-		sigprocmask(SIG_SETMASK, NULL, sigset)
-		sigaddset(sigset, sig)
-		sigprocmask(SIG_SETMASK, sigset, NULL)
-
-		fd = linuxfd.signalfd(signalset={sig}, nonBlocking=True)
+		fd = self.fd_pool.get_signalfd(sig)
 		self.add_reader(fd, SignalEvent(fd, func).callback)

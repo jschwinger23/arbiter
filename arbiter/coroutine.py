@@ -1,8 +1,8 @@
-import linuxfd
 from functools import wraps, partial
 from greenlet import greenlet as Greenlet
 
 from .ioloop import IOLoop
+from .fd_pool import FDPool
 
 EVENT_LOOP_COROUTINE = None
 
@@ -41,6 +41,8 @@ def _yield_current():
 
 
 class Coroutine:
+	_fd_pool = FDPool.get_instance()
+
 	@classmethod
 	def current(cls):
 		return cls(greenlet=Greenlet.getcurrent())
@@ -61,28 +63,38 @@ class Coroutine:
 		@wraps(target)
 		def wrapper():
 			target(*args, **kwargs)
-			self._finish_fd.write()
+			self._alive = False
+			if self._finish_fd:
+				self._finish_fd.write()
 
 		self.greenlet = Greenlet(wrapper)
 		if target != IOLoop.get_instance().run_forever:
 			self.greenlet.parent = _get_event_loop_coroutine().greenlet
 
-		self._finish_fd = linuxfd.eventfd(initval=0, nonBlocking=True)
+		self._alive = False
+		self._finish_fd = None
 
 	def resume(self):
 		return self.greenlet.switch()
 
 	def start(self):
+		self._alive = True
 		ioloop = IOLoop.get_instance()
 		ioloop.call_soon(self.greenlet.switch)
 		sleep(0)
 
+	def is_alive(self):
+		return self._alive
+
 	def join(self):
-		ioloop = IOLoop.get_instance()
+		if not self.is_alive():
+			return
 
 		def callback(resume, ioloop):
 			ioloop.del_reader(self._finish_fd)
 			resume()
 
+		ioloop = IOLoop.get_instance()
+		self._finish_fd = self._fd_pool.get_eventfd()
 		ioloop.add_reader(self._finish_fd, partial(callback, _resume_current()))
 		_yield_current()
